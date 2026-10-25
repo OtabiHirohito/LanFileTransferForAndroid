@@ -1,0 +1,15 @@
+.gradle/
+build/
+local.properties
+*.iml
+.idea/
+.kotlin/
+captures/
+.externalNativeBuild/
+.cxx/
+app/release/
+
+# tools/LftPeer (.NET)
+bin/
+obj/
+*.user

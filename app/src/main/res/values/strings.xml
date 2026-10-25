@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">LAN File Transfer</string>
+    <string name="notification_channel_name">ファイル転送</string>
+    <string name="notification_channel_description">ファイルの送受信の進捗を表示します。</string>
+</resources>
