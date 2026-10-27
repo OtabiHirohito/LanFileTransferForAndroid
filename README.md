@@ -191,9 +191,6 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 sdk.dir=C\:\\Users\\<user>\\AppData\\Local\\Android\\Sdk
 ```
 
-リリースビルド(`:app:assembleRelease`)は署名設定を含まないため、そのままではインストールできません。
-配布する場合は `app/build.gradle.kts` に `signingConfig` を追加してください。
-
 ### リリース
 
 最新版は [GitHub Releases](https://github.com/OtabiHirohito/LanFileTransferForAndroid/releases) から
@@ -238,7 +235,7 @@ android/
 ## ライセンス
 
 このプロジェクトは **MIT ライセンス** のもとで公開されています。
-詳細は [LICENSE.txt](../LICENSE.txt) をご覧ください。
+詳細は [LICENSE.txt](LICENSE.txt) をご覧ください。
 
 ## 寄付について
 
