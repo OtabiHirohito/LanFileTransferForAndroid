@@ -5,7 +5,9 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
 import android.os.Build
+import android.util.Size
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -22,6 +24,7 @@ import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -38,7 +41,6 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
@@ -61,15 +63,20 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.StrokeCap
@@ -90,11 +97,14 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import com.lanfiletransfer.MainViewModel
+import com.lanfiletransfer.PendingFile
 import com.lanfiletransfer.R
 import com.lanfiletransfer.TransferEngine
 import com.lanfiletransfer.UiMode
 import com.lanfiletransfer.storage.ReceiveDestinations
 import com.lanfiletransfer.util.formatBytes
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
 /** Windows 版 (Theme.xaml) のデザインに合わせたメイン画面。 */
 @Composable
@@ -106,6 +116,11 @@ fun MainScreen(vm: MainViewModel) {
     val filePicker = rememberLauncherForActivityResult(
         ActivityResultContracts.OpenMultipleDocuments()
     ) { uris -> if (uris.isNotEmpty()) vm.addFiles(uris) }
+
+    // 送信用: 選んだフォルダ配下のファイルをすべて追加する。
+    val sendFolderPicker = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocumentTree()
+    ) { uri -> if (uri != null) vm.addFolder(uri) }
 
     val folderPicker = rememberLauncherForActivityResult(
         ActivityResultContracts.OpenDocumentTree()
@@ -188,6 +203,8 @@ fun MainScreen(vm: MainViewModel) {
                         vm = vm,
                         running = engine.mode == TransferEngine.Mode.SENDING,
                         onPickFiles = { filePicker.launch(arrayOf("*/*")) },
+                        onPickFolder = { sendFolderPicker.launch(null) },
+                        onClearFiles = vm::clearFiles,
                         onStart = {
                             ensureNotificationPermission()
                             show(vm.startSend())
@@ -629,6 +646,8 @@ private fun SendCard(
     vm: MainViewModel,
     running: Boolean,
     onPickFiles: () -> Unit,
+    onPickFolder: () -> Unit,
+    onClearFiles: () -> Unit,
     onStart: () -> Unit,
     onStop: () -> Unit
 ) {
@@ -658,72 +677,60 @@ private fun SendCard(
             )
         }
 
-        Row(verticalAlignment = Alignment.CenterVertically) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
             SecondaryButton(
                 text = "ファイルを選択…",
                 enabled = !running,
                 onClick = onPickFiles
             )
-            Spacer(Modifier.weight(1f))
+            SecondaryButton(
+                text = "フォルダを選択…",
+                enabled = !running,
+                onClick = onPickFolder
+            )
+        }
+
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            val knownTotal = vm.files.sumOf { it.size.coerceAtLeast(0L) }
+            val hasUnknownSize = vm.files.any { it.size < 0 }
             Text(
-                "${vm.files.size} 件",
+                if (vm.files.isEmpty()) {
+                    "0 件"
+                } else {
+                    "${vm.files.size} 件 ・ 合計 ${formatBytes(knownTotal)}" +
+                        if (hasUnknownSize) "（サイズ不明を含む）" else ""
+                },
                 fontSize = 12.sp,
                 color = LftColors.textSecondary
             )
+            Spacer(Modifier.weight(1f))
+            if (vm.files.isNotEmpty()) {
+                GhostButton(
+                    text = "すべて削除",
+                    enabled = !running,
+                    onClick = onClearFiles
+                )
+            }
         }
 
         if (vm.files.isNotEmpty()) {
             LftDivider()
-            LazyColumn(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .heightIn(max = 176.dp)
-            ) {
-                items(vm.files, key = { it.uri.toString() }) { file ->
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(vertical = 6.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Box(
-                            modifier = Modifier
-                                .size(30.dp)
-                                .clip(RoundedCornerShape(8.dp))
-                                .background(LftColors.accentSoft),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            Icon(
-                                painter = painterResource(R.drawable.ic_file),
-                                contentDescription = null,
-                                tint = Color.Unspecified,
-                                modifier = Modifier.size(16.dp)
-                            )
-                        }
-
-                        Spacer(Modifier.width(10.dp))
-
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text(
-                                file.name,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                                fontSize = 13.sp,
-                                color = LftColors.textPrimary
-                            )
-                            Text(
-                                if (file.size >= 0) formatBytes(file.size) else "サイズ不明",
-                                fontSize = 11.sp,
-                                color = LftColors.textMuted
-                            )
-                        }
-
-                        GhostButton(
-                            text = "削除",
-                            enabled = !running,
-                            onClick = { vm.removeFile(file.uri) }
-                        )
+            // 画面全体がスクロールするので、ここは LazyColumn にせず全件をそのまま並べる。
+            // (入れ子のスクロール + 高さ制限があると一覧が非常に操作しづらくなるため)
+            Column(modifier = Modifier.fillMaxWidth()) {
+                vm.files.forEachIndexed { index, file ->
+                    if (index > 0) {
+                        LftDivider()
                     }
+                    SelectedFileRow(
+                        file = file,
+                        enabled = !running,
+                        onRemove = { vm.removeFile(file.uri) }
+                    )
                 }
             }
         }
@@ -748,6 +755,96 @@ private fun SendCard(
             lineHeight = 16.sp,
             color = LftColors.textMuted
         )
+    }
+}
+
+@Composable
+private fun SelectedFileRow(
+    file: PendingFile,
+    enabled: Boolean,
+    onRemove: () -> Unit
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 6.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        FileThumbnail(file)
+
+        Spacer(Modifier.width(10.dp))
+
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                file.name,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                fontSize = 13.sp,
+                color = LftColors.textPrimary
+            )
+            val sizeText = if (file.size >= 0) formatBytes(file.size) else "サイズ不明"
+            Text(
+                if (file.parentLabel.isNullOrBlank()) {
+                    sizeText
+                } else {
+                    "${file.parentLabel} ・ $sizeText"
+                },
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                fontSize = 11.sp,
+                color = LftColors.textMuted
+            )
+        }
+
+        GhostButton(
+            text = "削除",
+            enabled = enabled,
+            onClick = onRemove
+        )
+    }
+}
+
+/** 画像・動画はサムネイル、それ以外はファイルアイコンを表示する (API 29+ でサムネイル取得)。 */
+@Composable
+private fun FileThumbnail(file: PendingFile) {
+    val context = LocalContext.current
+    val isVisual = file.mimeType?.startsWith("image/") == true ||
+        file.mimeType?.startsWith("video/") == true
+    var bitmap by remember(file.uri) { mutableStateOf<Bitmap?>(null) }
+
+    LaunchedEffect(file.uri, isVisual) {
+        if (isVisual && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            bitmap = withContext(Dispatchers.IO) {
+                runCatching {
+                    context.contentResolver.loadThumbnail(file.uri, Size(96, 96), null)
+                }.getOrNull()
+            }
+        }
+    }
+
+    Box(
+        modifier = Modifier
+            .size(30.dp)
+            .clip(RoundedCornerShape(8.dp))
+            .background(LftColors.accentSoft),
+        contentAlignment = Alignment.Center
+    ) {
+        val loaded = bitmap
+        if (loaded != null) {
+            Image(
+                bitmap = loaded.asImageBitmap(),
+                contentDescription = null,
+                contentScale = ContentScale.Crop,
+                modifier = Modifier.fillMaxSize()
+            )
+        } else {
+            Icon(
+                painter = painterResource(R.drawable.ic_file),
+                contentDescription = null,
+                tint = Color.Unspecified,
+                modifier = Modifier.size(16.dp)
+            )
+        }
     }
 }
 

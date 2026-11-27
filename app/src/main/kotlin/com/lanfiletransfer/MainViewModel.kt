@@ -3,19 +3,31 @@ package com.lanfiletransfer
 import android.app.Application
 import android.content.Intent
 import android.net.Uri
+import android.provider.DocumentsContract
 import android.provider.OpenableColumns
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.viewModelScope
 import com.lanfiletransfer.net.LocalAddresses
 import com.lanfiletransfer.service.TransferService
 import com.lanfiletransfer.storage.ReceiveDestinations
 import java.io.IOException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 enum class UiMode { SEND, RECEIVE }
 
-data class PendingFile(val uri: Uri, val name: String, val size: Long)
+data class PendingFile(
+    val uri: Uri,
+    val name: String,
+    val size: Long,
+    /** 同名ファイルの判別用に表示する親フォルダ名 (分かる場合のみ)。 */
+    val parentLabel: String? = null,
+    val mimeType: String? = null
+)
 
 /** 画面の状態と操作。 */
 class MainViewModel(application: Application) : AndroidViewModel(application) {
@@ -92,6 +104,111 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun removeFile(uri: Uri) {
         files = files.filterNot { it.uri == uri }
     }
+
+    fun clearFiles() {
+        files = emptyList()
+    }
+
+    /**
+     * フォルダ選択 (SAF ツリー) から、配下のファイルを再帰的にすべて追加する。
+     * 走査はバックグラウンドで行い、追加件数をログに残す。
+     */
+    fun addFolder(treeUri: Uri) {
+        viewModelScope.launch {
+            val found = runCatching { collectFolderFiles(treeUri) }
+                .getOrElse {
+                    TransferEngine.log("フォルダを読み込めませんでした: ${it.message}")
+                    return@launch
+                }
+            if (found.isEmpty()) {
+                TransferEngine.log("選択したフォルダにファイルがありませんでした。")
+                return@launch
+            }
+            val known = files.map { it.uri }.toHashSet()
+            val appended = found.filterNot { it.uri in known }
+            if (appended.isNotEmpty()) {
+                files = files + appended
+            }
+            TransferEngine.log("フォルダから ${appended.size} 件追加しました。")
+        }
+    }
+
+    /** 他アプリの共有 (ACTION_SEND / SEND_MULTIPLE) からファイルを受け取る。 */
+    fun acceptSharedFiles(uris: List<Uri>) {
+        if (uris.isEmpty() || engine.value.isRunning) {
+            return
+        }
+        mode = UiMode.SEND
+        settings.lastMode = AppSettings.MODE_SEND
+        addFiles(uris)
+        TransferEngine.log("共有されたファイルを追加しました。")
+    }
+
+    private suspend fun collectFolderFiles(treeUri: Uri): List<PendingFile> =
+        withContext(Dispatchers.IO) {
+            val resolver = getApplication<Application>().contentResolver
+            val rootId = DocumentsContract.getTreeDocumentId(treeUri)
+            val rootName = runCatching {
+                val rootUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, rootId)
+                resolver.query(
+                    rootUri,
+                    arrayOf(OpenableColumns.DISPLAY_NAME),
+                    null,
+                    null,
+                    null
+                )?.use { cursor ->
+                    if (cursor.moveToFirst()) cursor.getString(0) else null
+                }
+            }.getOrNull().orEmpty()
+
+            val result = mutableListOf<PendingFile>()
+            // (documentId, 表示用の相対フォルダ名) のスタック
+            val stack = ArrayDeque<Pair<String, String>>()
+            stack.addLast(rootId to rootName)
+
+            while (stack.isNotEmpty() && result.size < MAX_FOLDER_FILES) {
+                val (parentId, parentLabel) = stack.removeLast()
+                val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(
+                    treeUri,
+                    parentId
+                )
+                resolver.query(
+                    childrenUri,
+                    arrayOf(
+                        DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                        DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+                        DocumentsContract.Document.COLUMN_MIME_TYPE,
+                        DocumentsContract.Document.COLUMN_SIZE
+                    ),
+                    null,
+                    null,
+                    null
+                )?.use { cursor ->
+                    while (cursor.moveToNext() && result.size < MAX_FOLDER_FILES) {
+                        val documentId = cursor.getString(0) ?: continue
+                        val name = cursor.getString(1)?.takeIf { it.isNotBlank() } ?: continue
+                        val mime = cursor.getString(2)
+                        if (mime == DocumentsContract.Document.MIME_TYPE_DIR) {
+                            val label = if (parentLabel.isBlank()) name else "$parentLabel/$name"
+                            stack.addLast(documentId to label)
+                        } else {
+                            val size = if (cursor.isNull(3)) -1L else cursor.getLong(3)
+                            result += PendingFile(
+                                uri = DocumentsContract.buildDocumentUriUsingTree(
+                                    treeUri,
+                                    documentId
+                                ),
+                                name = name,
+                                size = size,
+                                parentLabel = parentLabel.takeIf { it.isNotBlank() },
+                                mimeType = mime
+                            )
+                        }
+                    }
+                }
+            }
+            result
+        }
 
     fun startSend(): String? {
         if (engine.value.isRunning) {
@@ -223,6 +340,36 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             ?: uri.lastPathSegment?.substringAfterLast('/')?.takeIf { it.isNotBlank() }
             ?: return null
 
-        return PendingFile(uri, displayName, size)
+        val mime = runCatching { resolver.getType(uri) }.getOrNull()
+        // 親フォルダ名は表示専用の付加情報。取得に失敗してもファイル追加自体は
+        // 絶対に失敗させないよう、ここで例外を握りつぶす。
+        val parentLabel = runCatching { parentLabelFromUri(uri, displayName) }.getOrNull()
+        return PendingFile(
+            uri = uri,
+            name = displayName,
+            size = size,
+            parentLabel = parentLabel,
+            mimeType = mime
+        )
+    }
+
+    /**
+     * content Uri から親フォルダ名を推定する (表示専用のベストエフォート)。
+     * 例: "primary:Download/photos/a.jpg" -> "photos"、取れなければ null。
+     */
+    private fun parentLabelFromUri(uri: Uri, fileName: String): String? {
+        val segment = uri.lastPathSegment ?: return null
+        val decoded = Uri.decode(segment)
+        val path = decoded.substringAfter(':', decoded)
+        val parts = path.split('/').filter { it.isNotBlank() }
+        return if (parts.size >= 2 && parts.last() == fileName) {
+            parts[parts.size - 2]
+        } else {
+            null
+        }
+    }
+
+    private companion object {
+        const val MAX_FOLDER_FILES = 10_000
     }
 }
